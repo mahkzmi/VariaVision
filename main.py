@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "best.pt"
+MODEL_PATH = "best_int8.onnx"
 HF_REPO_ID = os.getenv("HF_REPO_ID", "mahkzmi/Varia-Vision-Model")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
@@ -26,7 +26,7 @@ if not os.path.exists(MODEL_PATH):
         print("Downloading model securely from Hugging Face...")
         MODEL_PATH = hf_hub_download(
             repo_id=HF_REPO_ID,
-            filename="best.pt",
+            filename="best_int8.onnx",
             token=HF_TOKEN
         )
         print("Model downloaded successfully!")
