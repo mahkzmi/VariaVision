@@ -1,14 +1,15 @@
 import os
 import io
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from datetime import datetime
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
 from PIL import Image
 from huggingface_hub import hf_hub_download
 from fastapi.middleware.cors import CORSMiddleware
 
-
 app = FastAPI(title="Varia Vision API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -38,13 +39,35 @@ try:
 except Exception as e:
     print(f"Error loading model: {e}")
 
-# --- ۲. API Endpoints ---
+# --- سیستم محدودیت رایگان (Free Tier) ---
+usage_tracker = {}
+FREE_LIMIT = 10 # تعداد دفعات رایگان در روز
+
+def check_limit(ip: str):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if ip not in usage_tracker or usage_tracker[ip]["date"] != today:
+        usage_tracker[ip] = {"date": today, "count": 0}
+        
+    if usage_tracker[ip]["count"] >= FREE_LIMIT:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Free limit of {FREE_LIMIT} requests per day exceeded. To get a full API key, visit: https://variastudio.framer.website"
+        )
+    usage_tracker[ip]["count"] += 1
+
 @app.get("/")
 def read_root():
-    return {"message": "Varia Vision API is running. Send a POST request to /detect."}
+    return {"message": "Varia Vision API is running.", "free_limit": f"{FREE_LIMIT} requests/day"}
 
 @app.post("/detect")
-async def detect_weed(file: UploadFile = File(...)):
+async def detect_weed(request: Request, file: UploadFile = File(...)):
+    # ۱. چک کردن محدودیت کاربر
+    client_ip = request.client.host
+    check_limit(client_ip)
+
+    # ۲. ثبت لاگ درخواست
+    print(f"API REQUEST: {file.filename} | IP: {client_ip} | Time: {datetime.now()}")
+
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
     
@@ -70,6 +93,8 @@ async def detect_weed(file: UploadFile = File(...)):
         })
         
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
