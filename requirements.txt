@@ -5,4 +5,3 @@ huggingface_hub
 pillow
 numpy
 onnxruntime
-ultralytics
