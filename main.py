@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import threading
+import time
+import warnings
 from datetime import datetime, timezone
 
 import numpy as np
@@ -17,30 +19,36 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("varia-vision")
 
-app = FastAPI(title="Varia Vision API")
-allowed_origins = [x.strip() for x in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
+app = FastAPI(title="Varia Vision API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MODEL_FILENAME = "best_int8.onnx"
 MODEL_PATH = os.getenv("MODEL_PATH", MODEL_FILENAME)
 HF_REPO_ID = os.getenv("HF_REPO_ID", "mahkzmi/Varia-Vision-Model")
 HF_TOKEN = os.getenv("HF_TOKEN") or None
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "30000000"))
+MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "2048"))
 CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.25"))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.45"))
 MAX_DETECTIONS = int(os.getenv("MAX_DETECTIONS", "300"))
 FREE_LIMIT = int(os.getenv("FREE_LIMIT_PER_DAY", "10"))
 
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+warnings.simplefilter("error", Image.DecompressionBombWarning)
+
 usage_tracker = {}
 usage_lock = threading.Lock()
+inference_lock = threading.Lock()
 session = None
 input_name = None
+input_dtype = np.float32
 input_width = input_height = 640
 class_names = {}
 
@@ -82,26 +90,26 @@ def load_onnx_model(path):
     width = shape[3] if isinstance(shape[3], int) else 640
     names = parse_names((sess.get_modelmeta().custom_metadata_map or {}).get("names"))
     if not names:
-        names = {0: "weed", 1: "crop"}
-        logger.warning("ONNX metadata has no class names; fallback labels are in use")
+        names = {0: "weed"}
+        logger.warning("ONNX metadata has no class names; using the known single-class label 'weed'")
     logger.info("ONNX input=%s shape=%s classes=%s providers=%s", inp.name, shape, names, sess.get_providers())
-    return sess, inp.name, width, height, names
+    return sess, inp.name, width, height, names, (np.float16 if inp.type == "tensor(float16)" else np.float32)
 
 
 @app.on_event("startup")
 def load_model():
-    global session, input_name, input_width, input_height, class_names
+    global session, input_name, input_width, input_height, class_names, input_dtype
     path = MODEL_PATH
     try:
         if not os.path.isfile(path):
             logger.info("Downloading model %s from Hugging Face", MODEL_FILENAME)
             path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILENAME, token=HF_TOKEN)
-        session, input_name, input_width, input_height, class_names = load_onnx_model(path)
+        session, input_name, input_width, input_height, class_names, input_dtype = load_onnx_model(path)
         logger.info("Varia Vision ONNX Runtime model loaded from %s", path)
-    except Exception as exc:
+    except Exception:
         session = None
         logger.exception("Varia Vision model initialization failed")
-        raise RuntimeError("Varia Vision model could not be initialized") from exc
+        raise RuntimeError("Varia Vision model could not be initialized")
 
 
 def check_limit(client_ip):
@@ -117,17 +125,26 @@ def check_limit(client_ip):
 
 
 def preprocess(image):
-    image = ImageOps.exif_transpose(image).convert("RGB")
+    image = ImageOps.exif_transpose(image)
     original_width, original_height = image.size
-    scale = min(input_width / original_width, input_height / original_height)
-    rw, rh = max(1, round(original_width * scale)), max(1, round(original_height * scale))
-    resized = image.resize((rw, rh), Image.Resampling.BILINEAR)
+
+    # Downscale large photos before RGB conversion to keep memory bounded on the free instance.
+    image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
+    work_width, work_height = image.size
+    scale = min(input_width / work_width, input_height / work_height)
+    resized_width = max(1, round(work_width * scale))
+    resized_height = max(1, round(work_height * scale))
+    resized = image.resize((resized_width, resized_height), Image.Resampling.BILINEAR).convert("RGB")
+
     canvas = Image.new("RGB", (input_width, input_height), (114, 114, 114))
-    pad_x, pad_y = (input_width - rw) // 2, (input_height - rh) // 2
+    pad_x = (input_width - resized_width) // 2
+    pad_y = (input_height - resized_height) // 2
     canvas.paste(resized, (pad_x, pad_y))
-    tensor = np.asarray(canvas, dtype=np.float32) / 255.0
+    tensor = np.asarray(canvas, dtype=input_dtype) / 255.0
     tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
-    return tensor, original_width, original_height, scale, pad_x, pad_y
+    scale_x = resized_width / original_width
+    scale_y = resized_height / original_height
+    return tensor, original_width, original_height, scale_x, scale_y, pad_x, pad_y
 
 
 def iou_one_to_many(box, boxes):
@@ -159,8 +176,10 @@ def nms(boxes, scores, class_ids):
 
 
 def run_inference(image):
-    tensor, ow, oh, scale, pad_x, pad_y = preprocess(image)
-    outputs = session.run(None, {input_name: tensor})
+    tensor, original_width, original_height, scale_x, scale_y, pad_x, pad_y = preprocess(image)
+    with inference_lock:
+        outputs = session.run(None, {input_name: tensor})
+    del tensor
     if not outputs:
         raise RuntimeError("ONNX model returned no outputs")
     output = np.squeeze(np.asarray(outputs[0]))
@@ -189,7 +208,7 @@ def run_inference(image):
         class_ids = np.argmax(class_scores, axis=1).astype(np.int32)
         scores = class_scores[np.arange(len(class_ids)), class_ids].astype(np.float32)
         cx, cy, width, height = (rows[:, i] for i in range(4))
-        boxes = np.stack((cx-width/2, cy-height/2, cx+width/2, cy+height/2), axis=1).astype(np.float32)
+        boxes = np.stack((cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2), axis=1).astype(np.float32)
 
     valid = np.isfinite(boxes).all(axis=1) & np.isfinite(scores) & (scores >= CONF_THRESHOLD)
     valid &= (class_ids >= 0) & (class_ids < len(class_names))
@@ -200,8 +219,8 @@ def run_inference(image):
         indices = nms(boxes, scores, class_ids)
         boxes, scores, class_ids = boxes[indices], scores[indices], class_ids[indices]
 
-    boxes[:, [0, 2]] = np.clip((boxes[:, [0, 2]] - pad_x) / scale, 0, ow)
-    boxes[:, [1, 3]] = np.clip((boxes[:, [1, 3]] - pad_y) / scale, 0, oh)
+    boxes[:, [0, 2]] = np.clip((boxes[:, [0, 2]] - pad_x) / scale_x, 0, original_width)
+    boxes[:, [1, 3]] = np.clip((boxes[:, [1, 3]] - pad_y) / scale_y, 0, original_height)
     return [
         {
             "class": class_names.get(int(cid), f"class_{int(cid)}"),
@@ -214,8 +233,11 @@ def run_inference(image):
 
 @app.get("/")
 def read_root():
-    return {"message": "Varia Vision API is running.", "model_loaded": session is not None,
-            "free_limit": f"{FREE_LIMIT} requests/day per running instance"}
+    return {
+        "message": "Varia Vision API is running.",
+        "model_loaded": session is not None,
+        "free_limit": f"{FREE_LIMIT} requests/day per running instance",
+    }
 
 
 @app.get("/health")
@@ -229,34 +251,74 @@ def health():
 async def detect_weed(request: Request, file: UploadFile = File(...)):
     if session is None:
         raise HTTPException(status_code=503, detail="Detection model is unavailable.")
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image.")
+
     try:
         image_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
     finally:
         await file.close()
+
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
     if len(image_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"Image exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image is larger than the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+        )
+
     try:
-        with Image.open(io.BytesIO(image_bytes)) as im:
-            im.verify()
-        with Image.open(io.BytesIO(image_bytes)) as im:
-            image = ImageOps.exif_transpose(im).convert("RGB")
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid supported image.")
+        with Image.open(io.BytesIO(image_bytes)) as probe:
+            image_format = probe.format
+            width, height = probe.size
+            if width < 2 or height < 2:
+                raise HTTPException(status_code=400, detail="Image dimensions are too small.")
+            if width * height > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Image has {width * height:,} pixels; the safe limit is {MAX_IMAGE_PIXELS:,}.",
+                )
+            probe.verify()
+
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.seek(0)  # First frame for animated images.
+            source.load()
+            image = source.copy()
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise HTTPException(
+            status_code=400,
+            detail="This file is not a supported or valid image. Try JPG, PNG, WEBP, BMP, GIF, or TIFF.",
+        )
 
     client_ip = request.client.host if request.client else "unknown"
     check_limit(client_ip)
-    logger.info("Detection request received: filename=%s bytes=%s client_ip=%s", file.filename, len(image_bytes), client_ip)
+    started = time.perf_counter()
+    logger.info(
+        "Detection started: filename=%s bytes=%d format=%s dimensions=%dx%d client=%s",
+        file.filename, len(image_bytes), image_format, width, height, client_ip,
+    )
     try:
         detections = run_inference(image)
-        return JSONResponse(content={"status": "success", "filename": file.filename,
-                                     "detections_count": len(detections), "detections": detections})
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        logger.info(
+            "Detection completed: filename=%s detections=%d elapsed_ms=%s",
+            file.filename, len(detections), elapsed_ms,
+        )
+        return JSONResponse(content={
+            "status": "success",
+            "filename": file.filename,
+            "image_width": width,
+            "image_height": height,
+            "detections_count": len(detections),
+            "detections": detections,
+            "processing_time_ms": elapsed_ms,
+        })
     except Exception:
         logger.exception("Image inference failed")
-        raise HTTPException(status_code=500, detail="Image inference failed. Please retry later.")
+        raise HTTPException(status_code=500, detail="Image inference failed. Please retry with another image.")
+    finally:
+        image.close()
+        del image_bytes
 
 
 if __name__ == "__main__":
