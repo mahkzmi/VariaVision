@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 from PIL import Image, UnidentifiedImageError
-from ultralytics import YOLO
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("varia-vision")
@@ -44,6 +43,12 @@ model = None
 
 
 @app.on_event("startup")
+def load_yolo_model(model_path: str):
+    """Import the heavy inference runtime only when the service starts."""
+    from ultralytics import YOLO
+    return YOLO(model_path)
+
+
 def load_model():
     """Load the detector before accepting traffic; fail startup if unavailable."""
     global model
@@ -56,7 +61,7 @@ def load_model():
                 filename=MODEL_FILENAME,
                 token=HF_TOKEN,
             )
-        model = YOLO(resolved_model_path)
+        model = load_yolo_model(resolved_model_path)
         logger.info("Varia Vision model loaded from %s", resolved_model_path)
     except Exception as exc:
         model = None
