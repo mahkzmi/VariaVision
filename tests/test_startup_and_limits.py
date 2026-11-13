@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import main
+from fastapi.testclient import TestClient
 
 
 class ModelStartupTests(unittest.TestCase):
@@ -22,6 +23,22 @@ class ModelStartupTests(unittest.TestCase):
             main, "load_yolo_model", return_value=sentinel
         ):
             main.load_model()
+        self.assertIs(main.model, sentinel)
+
+
+class StartupLifecycleTests(unittest.TestCase):
+    def tearDown(self):
+        main.model = None
+
+    def test_fastapi_startup_event_loads_model_before_requests(self):
+        sentinel = object()
+        with patch.object(main.os.path, "isfile", return_value=True), patch.object(
+            main, "load_yolo_model", return_value=sentinel
+        ):
+            with TestClient(main.app) as client:
+                response = client.get("/health")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["model_loaded"])
         self.assertIs(main.model, sentinel)
 
 
