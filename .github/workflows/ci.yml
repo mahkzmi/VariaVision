@@ -16,7 +16,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install lightweight API test dependencies
-        run: python -m pip install fastapi python-multipart huggingface_hub pillow
+        run: python -m pip install fastapi python-multipart huggingface_hub pillow httpx
       - name: Compile API and tests
         run: python -m compileall -q main.py tests
       - name: Run unit tests
