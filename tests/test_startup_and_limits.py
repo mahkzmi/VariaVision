@@ -19,7 +19,7 @@ class ModelStartupTests(unittest.TestCase):
     def test_startup_loads_existing_model(self):
         sentinel = object()
         with patch.object(main.os.path, "isfile", return_value=True), patch.object(
-            main, "YOLO", return_value=sentinel
+            main, "load_yolo_model", return_value=sentinel
         ):
             main.load_model()
         self.assertIs(main.model, sentinel)
