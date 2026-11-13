@@ -42,13 +42,13 @@ usage_lock = threading.Lock()
 model = None
 
 
-@app.on_event("startup")
 def load_yolo_model(model_path: str):
     """Import the heavy inference runtime only when the service starts."""
     from ultralytics import YOLO
     return YOLO(model_path)
 
 
+@app.on_event("startup")
 def load_model():
     """Load the detector before accepting traffic; fail startup if unavailable."""
     global model
